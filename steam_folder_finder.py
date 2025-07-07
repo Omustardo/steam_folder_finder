@@ -12,9 +12,103 @@ import subprocess
 import threading
 import urllib.request
 import urllib.error
+import urllib.parse
 from pathlib import Path
 import time
 import argparse
+import re
+from html.parser import HTMLParser
+
+class PCGamingWikiParser(HTMLParser):
+    """Parse PC Gaming Wiki pages to extract save game locations"""
+    
+    def __init__(self):
+        super().__init__()
+        self.in_save_section = False
+        self.in_table_row = False
+        self.in_table_cell = False
+        self.current_cell_data = ""
+        self.current_row = []
+        self.save_locations = []
+        self.cell_count = 0
+        self.debug_sections = []
+        
+    def handle_starttag(self, tag, attrs):
+        # Look for save game data location section
+        if tag == "span":
+            for attr_name, attr_value in attrs:
+                if attr_name == "id" and attr_value:
+                    self.debug_sections.append(attr_value)
+                    if "save" in attr_value.lower() and "game" in attr_value.lower():
+                        print(f"[DEBUG] Found save section: {attr_value}")
+                        self.in_save_section = True
+                        
+        # Track table structure
+        elif tag == "tr" and self.in_save_section:
+            self.in_table_row = True
+            self.current_row = []
+            self.cell_count = 0
+            
+        elif tag == "td" and self.in_table_row:
+            self.in_table_cell = True
+            self.current_cell_data = ""
+            
+    def handle_endtag(self, tag):
+        if tag == "td" and self.in_table_cell:
+            self.in_table_cell = False
+            self.current_row.append(self.current_cell_data.strip())
+            self.cell_count += 1
+            
+        elif tag == "tr" and self.in_table_row:
+            self.in_table_row = False
+            print(f"[DEBUG] Processing table row: {self.current_row}")
+            # Process completed row - look for paths
+            if self.current_row:
+                # Check if this is a single-column table with just the path
+                if len(self.current_row) == 1:
+                    path = self.current_row[0]
+                    print(f"[DEBUG] Single column path: '{path}'")
+                    if path and not path.startswith("N/A") and ("%" in path or "steamapps" in path):
+                        path = path.replace("&lt;", "<").replace("&gt;", ">")
+                        
+                        # If path ends with a filename, get the directory
+                        if "\\" in path and not path.endswith("\\"):
+                            # Check if last part looks like a filename
+                            last_part = path.split("\\")[-1]
+                            if "." in last_part and not last_part.startswith("."):
+                                path = "\\".join(path.split("\\")[:-1])
+                                print(f"[DEBUG] Removed filename, using directory: {path}")
+                        
+                        print(f"[DEBUG] Adding save location: {path}")
+                        self.save_locations.append(path)
+                        
+                # Check traditional two-column format (system, path)
+                elif len(self.current_row) >= 2:
+                    system = self.current_row[0].lower() if self.current_row[0] else ""
+                    path = self.current_row[1] if len(self.current_row) > 1 else ""
+                    
+                    print(f"[DEBUG] Row system: '{system}', path: '{path}'")
+                    
+                    if ("windows" in system or "steam" in system) and path:
+                        # Clean up the path
+                        path = path.replace("&lt;", "<").replace("&gt;", ">")
+                        if path and not path.startswith("N/A"):
+                            print(f"[DEBUG] Adding save location: {path}")
+                            self.save_locations.append(path)
+                        
+        elif tag == "table" and self.in_save_section:
+            print(f"[DEBUG] End of save section table")
+            self.in_save_section = False  # End of save section
+            
+    def handle_data(self, data):
+        if self.in_table_cell:
+            self.current_cell_data += data
+    
+    def get_debug_info(self):
+        return {
+            "sections_found": self.debug_sections,
+            "save_locations": self.save_locations
+        }
 
 class SteamGameFinder:
     def __init__(self, steam_libraries=None):
@@ -31,6 +125,8 @@ class SteamGameFinder:
         # Cache for Steam app list
         self.steam_apps = []
         self.cache_file = os.path.expanduser("~/.cache/steam_apps.json")
+        self.current_wiki_url = ""
+        self.wiki_link_label = None  # Initialize to prevent AttributeError
         
         self.setup_ui()
         self.load_steam_apps()
@@ -87,6 +183,7 @@ class SteamGameFinder:
         self.search_entry = ttk.Entry(main_frame, textvariable=self.search_var, width=50)
         self.search_entry.grid(row=2, column=1, sticky=(tk.W, tk.E), padx=(0, 10))
         self.search_entry.bind('<KeyRelease>', self.on_search_changed)
+        self.search_entry.bind('<Control-a>', self.select_all_text)
         self.search_entry.focus_set()  # Auto-focus the search field
         
         # Results listbox
@@ -289,12 +386,26 @@ class SteamGameFinder:
         
         found_folders = []
         
+        # First, try to get save locations from PC Gaming Wiki
+        wiki_paths = self.get_save_paths_from_wiki(app_name)
+        
+        # Update wiki link in UI
+        wiki_url = self.game_name_to_wiki_url(app_name)
+        if self.wiki_link_label:  # Check if UI is initialized
+            self.wiki_link_label.config(text=f"PC Gaming Wiki: {app_name}")
+        self.current_wiki_url = wiki_url
+        
         # Check each Steam library
         for library in self.steam_libraries:
             compatdata_path = os.path.join(library, str(app_id))
             
             if os.path.exists(compatdata_path):
-                # Check Local, Roaming, and LocalLow AppData folders
+                # Try wiki paths first
+                for wiki_path in wiki_paths:
+                    wiki_folders = self.check_wiki_path(compatdata_path, wiki_path, app_name)
+                    found_folders.extend(wiki_folders)
+                
+                # Then check all AppData locations with heuristics
                 appdata_paths = [
                     ("AppData/Local", os.path.join(compatdata_path, "pfx", "drive_c", "users", "steamuser", "AppData", "Local")),
                     ("AppData/Roaming", os.path.join(compatdata_path, "pfx", "drive_c", "users", "steamuser", "AppData", "Roaming")),
@@ -423,7 +534,15 @@ class SteamGameFinder:
             if len(part) > 2 and part not in common_words:
                 words.append(part)
         
-        return words
+        # Also add some variations for better matching
+        variations = []
+        for word in words:
+            variations.append(word)
+            # Add without common prefixes/suffixes
+            if word.endswith('s') and len(word) > 3:
+                variations.append(word[:-1])  # Remove plural 's'
+        
+        return list(set(variations))  # Remove duplicates
     
     def calculate_folder_match_score(self, folder_name, game_words, full_game_name):
         """Calculate how likely a folder is related to the game"""
@@ -434,7 +553,18 @@ class SteamGameFinder:
         if folder_lower == full_game_name.lower():
             return 10
         
-        # Check for game words in folder name
+        # Check for substantial overlap in words
+        folder_words = set(re.split(r'[:\-\s\(\)]+', folder_lower))
+        game_word_set = set(game_words)
+        
+        # Calculate word overlap percentage
+        if folder_words and game_word_set:
+            overlap = len(folder_words.intersection(game_word_set))
+            total_game_words = len(game_word_set)
+            if overlap >= 2 or (overlap >= 1 and total_game_words <= 2):
+                score += overlap * 3  # Higher score for word overlap
+        
+        # Check for individual game words in folder name
         for word in game_words:
             if word in folder_lower:
                 score += 2
@@ -485,8 +615,8 @@ class SteamGameFinder:
                     pass
                 
                 # Check file extensions
-                save_extensions = ['.sav', '.save', '.dat', '.xml', '.json', '.cfg', '.ini', '.sl2', '.ess', '.bak']
-                save_patterns = ['save', 'profile', 'config', 'settings', 'user', 'slot', 'progress']
+                save_extensions = ['.sav', '.save', '.dat', '.xml', '.json', '.cfg', '.ini', '.sl2', '.ess', '.bak', '.vdf']
+                save_patterns = ['save', 'profile', 'config', 'settings', 'user', 'slot', 'progress', 'savegame']
                 
                 for ext in save_extensions:
                     if item_lower.endswith(ext):
@@ -515,6 +645,113 @@ class SteamGameFinder:
             pass
         
         return min(confidence, 10)  # Cap at 10
+    
+    def game_name_to_wiki_url(self, game_name):
+        """Convert game name to PC Gaming Wiki URL"""
+        # Basic cleanup
+        name = game_name.strip()
+        
+        # Handle common patterns
+        name = name.replace("®", "")  # Remove registered trademark
+        name = name.replace("™", "")  # Remove trademark
+        name = re.sub(r'\s+', ' ', name)  # Normalize whitespace
+        
+        # Replace spaces with underscores
+        name = name.replace(' ', '_')
+        
+        # URL encode special characters but keep underscores
+        name = urllib.parse.quote(name, safe='_')
+        
+        return f"https://www.pcgamingwiki.com/wiki/{name}"
+    
+    def get_save_paths_from_wiki(self, game_name):
+        """Get save game paths from PC Gaming Wiki"""
+        try:
+            url = self.game_name_to_wiki_url(game_name)
+            print(f"[DEBUG] Trying wiki URL: {url}")
+            self.status_var.set(f"Checking PC Gaming Wiki for {game_name}...")
+            
+            # Try to fetch the page
+            request = urllib.request.Request(url, headers={
+                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
+            })
+            
+            with urllib.request.urlopen(request, timeout=10) as response:
+                print(f"[DEBUG] Wiki response status: {response.status}")
+                if response.status == 200:
+                    html = response.read().decode('utf-8', errors='ignore')
+                    print(f"[DEBUG] Wiki HTML length: {len(html)} characters")
+                    
+                    # Parse the HTML
+                    parser = PCGamingWikiParser()
+                    parser.feed(html)
+                    
+                    debug_info = parser.get_debug_info()
+                    print(f"[DEBUG] All sections found: {debug_info['sections_found']}")
+                    print(f"[DEBUG] Parser found {len(parser.save_locations)} save locations:")
+                    for i, loc in enumerate(parser.save_locations):
+                        print(f"[DEBUG]   {i+1}: {loc}")
+                    
+                    if parser.save_locations:
+                        self.status_var.set(f"Found {len(parser.save_locations)} save paths from wiki")
+                        return parser.save_locations
+                    else:
+                        print(f"[DEBUG] No save locations found in wiki page")
+                        
+        except urllib.error.HTTPError as e:
+            print(f"[DEBUG] Wiki HTTP error: {e.code} - {e.reason}")
+        except urllib.error.URLError as e:
+            print(f"[DEBUG] Wiki URL error: {e.reason}")
+        except Exception as e:
+            print(f"[DEBUG] Wiki unexpected error: {type(e).__name__}: {e}")
+            
+        print(f"[DEBUG] Wiki lookup failed, falling back to heuristics")
+        return []
+    
+    def check_wiki_path(self, compatdata_path, wiki_path, game_name):
+        """Check if a wiki path exists in the compatdata structure"""
+        found_folders = []
+        print(f"[DEBUG] Checking wiki path: {wiki_path}")
+        
+        try:
+            # Skip invalid paths
+            if "<SteamLibrary-folder>" in wiki_path or "[Note" in wiki_path:
+                print(f"[DEBUG] Skipping placeholder path: {wiki_path}")
+                return found_folders
+                
+            # Convert Windows path variables to actual paths
+            if "%APPDATA%" in wiki_path:
+                base_path = os.path.join(compatdata_path, "pfx", "drive_c", "users", "steamuser", "AppData", "Roaming")
+                relative_path = wiki_path.replace("%APPDATA%", "").lstrip("\\").lstrip("/")
+                print(f"[DEBUG] Using APPDATA base: {base_path}")
+            elif "%LOCALAPPDATA%" in wiki_path:
+                base_path = os.path.join(compatdata_path, "pfx", "drive_c", "users", "steamuser", "AppData", "Local")
+                relative_path = wiki_path.replace("%LOCALAPPDATA%", "").lstrip("\\").lstrip("/")
+                print(f"[DEBUG] Using LOCALAPPDATA base: {base_path}")
+            elif "%USERPROFILE%" in wiki_path:
+                base_path = os.path.join(compatdata_path, "pfx", "drive_c", "users", "steamuser")
+                relative_path = wiki_path.replace("%USERPROFILE%", "").lstrip("\\").lstrip("/")
+                print(f"[DEBUG] Using USERPROFILE base: {base_path}")
+            else:
+                print(f"[DEBUG] Skipping unsupported path format: {wiki_path}")
+                return found_folders
+            
+            if relative_path:
+                # Convert backslashes to forward slashes
+                relative_path = relative_path.replace("\\", "/")
+                full_path = os.path.join(base_path, relative_path)
+                print(f"[DEBUG] Checking full path: {full_path}")
+                
+                if os.path.exists(full_path):
+                    print(f"[DEBUG] ✓ Found wiki path: {full_path}")
+                    found_folders.append(("PC Gaming Wiki Save Location", full_path))
+                else:
+                    print(f"[DEBUG] ✗ Wiki path does not exist: {full_path}")
+                    
+        except Exception as e:
+            print(f"[DEBUG] Error processing wiki path {wiki_path}: {type(e).__name__}: {e}")
+            
+        return found_folders
     
     def on_folder_double_click(self, event=None):
         """Handle double-click on folder to open it"""
@@ -560,6 +797,23 @@ class SteamGameFinder:
                 subprocess.run(["nautilus", path], check=True)
             except subprocess.CalledProcessError:
                 messagebox.showerror("Error", f"Could not open folder: {path}")
+    
+    def open_wiki_link(self, event=None):
+        """Open the PC Gaming Wiki link in browser"""
+        if self.current_wiki_url:
+            try:
+                subprocess.run(["xdg-open", self.current_wiki_url], check=True)
+            except subprocess.CalledProcessError:
+                try:
+                    # Fallback to other browsers
+                    subprocess.run(["firefox", self.current_wiki_url], check=True)
+                except subprocess.CalledProcessError:
+                    messagebox.showerror("Error", f"Could not open browser for: {self.current_wiki_url}")
+    
+    def select_all_text(self, event=None):
+        """Select all text in the search entry"""
+        self.search_entry.select_range(0, tk.END)
+        return 'break'  # Prevent default behavior
     
     def refresh_steam_apps(self):
         """Force refresh of Steam app list (kept for potential future use)"""
